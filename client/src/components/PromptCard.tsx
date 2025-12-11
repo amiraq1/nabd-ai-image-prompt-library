@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, memo, useCallback } from "react";
 import { Wand2, Copy, Check, Eye, Heart } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -14,7 +14,42 @@ interface PromptCardProps {
   onUnlike?: (promptId: string) => void;
 }
 
-export function PromptCard({ 
+// Optimized Image Component with lazy loading
+function OptimizedImage({ 
+  src, 
+  alt, 
+  className 
+}: { 
+  src: string; 
+  alt: string; 
+  className?: string;
+}) {
+  const [isLoaded, setIsLoaded] = useState(false);
+  const [hasError, setHasError] = useState(false);
+
+  if (hasError) {
+    return null;
+  }
+
+  return (
+    <>
+      {!isLoaded && (
+        <div className="absolute inset-0 animate-shimmer bg-muted" />
+      )}
+      <img
+        src={src}
+        alt={alt}
+        loading="lazy"
+        decoding="async"
+        className={`${className} ${isLoaded ? 'opacity-100' : 'opacity-0'} transition-opacity duration-300`}
+        onLoad={() => setIsLoaded(true)}
+        onError={() => setHasError(true)}
+      />
+    </>
+  );
+}
+
+export const PromptCard = memo(function PromptCard({ 
   prompt, 
   onGenerate, 
   onView, 
@@ -27,21 +62,35 @@ export function PromptCard({
 
   const category = categories.find((c) => c.id === prompt.category);
 
-  const handleCopy = async (e: React.MouseEvent) => {
+  const handleCopy = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
     await navigator.clipboard.writeText(prompt.promptText);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
-  };
+  }, [prompt.promptText]);
 
-  const handleLikeClick = (e: React.MouseEvent) => {
+  const handleLikeClick = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
     if (isLiked) {
       onUnlike?.(prompt.id);
     } else {
       onLike?.(prompt.id);
     }
-  };
+  }, [isLiked, onUnlike, onLike, prompt.id]);
+
+  const handleMouseEnter = useCallback(() => setIsHovered(true), []);
+  const handleMouseLeave = useCallback(() => setIsHovered(false), []);
+  const handleClick = useCallback(() => onView(prompt), [onView, prompt]);
+
+  const handleGenerate = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    onGenerate(prompt);
+  }, [onGenerate, prompt]);
+
+  const handleView = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    onView(prompt);
+  }, [onView, prompt]);
 
   const placeholderGradients = [
     "from-violet-500 to-purple-600",
@@ -57,15 +106,15 @@ export function PromptCard({
 
   return (
     <Card
-      className="group relative overflow-hidden cursor-pointer transition-all duration-300 hover:shadow-lg"
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={() => setIsHovered(false)}
-      onClick={() => onView(prompt)}
+      className="group relative overflow-hidden cursor-pointer transition-smooth hover:shadow-lg gpu-accelerated"
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
+      onClick={handleClick}
       data-testid={`card-prompt-${prompt.id}`}
     >
       <div className="aspect-[4/3] relative overflow-hidden">
         {prompt.generatedImageUrl ? (
-          <img
+          <OptimizedImage
             src={prompt.generatedImageUrl}
             alt={prompt.title}
             className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
@@ -88,23 +137,20 @@ export function PromptCard({
           <Button
             variant="ghost"
             size="icon"
-            className={`bg-background/60 backdrop-blur-sm ${isLiked ? 'text-red-500' : 'text-white'}`}
+            className={`bg-background/60 backdrop-blur-sm transition-bounce ${isLiked ? 'text-red-500 scale-110' : 'text-white'}`}
             onClick={handleLikeClick}
             data-testid={`button-like-${prompt.id}`}
           >
-            <Heart className={`h-5 w-5 ${isLiked ? 'fill-current' : ''}`} />
+            <Heart className={`h-5 w-5 transition-transform ${isLiked ? 'fill-current scale-110' : ''}`} />
           </Button>
         </div>
 
         <div 
-          className={`absolute inset-0 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center gap-3 transition-opacity duration-300 z-10 ${isHovered ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
+          className={`absolute inset-0 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center gap-3 transition-opacity duration-200 z-10 ${isHovered ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
         >
           <Button
-            onClick={(e) => {
-              e.stopPropagation();
-              onGenerate(prompt);
-            }}
-            className="bg-primary text-primary-foreground"
+            onClick={handleGenerate}
+            className="bg-primary text-primary-foreground transition-bounce hover:scale-105"
             data-testid={`button-generate-${prompt.id}`}
           >
             <Wand2 className="h-4 w-4 ml-2" />
@@ -112,11 +158,8 @@ export function PromptCard({
           </Button>
           <Button
             variant="outline"
-            className="bg-white/10 backdrop-blur-sm border-white/20 text-white"
-            onClick={(e) => {
-              e.stopPropagation();
-              onView(prompt);
-            }}
+            className="bg-white/10 backdrop-blur-sm border-white/20 text-white transition-bounce hover:scale-105"
+            onClick={handleView}
             data-testid={`button-view-${prompt.id}`}
           >
             <Eye className="h-4 w-4 ml-2" />
@@ -137,7 +180,7 @@ export function PromptCard({
       <div className="p-4 flex items-center justify-between gap-2">
         <div className="flex items-center gap-3 flex-1 min-w-0">
           <div className="flex items-center gap-1 text-muted-foreground text-sm shrink-0">
-            <Heart className={`h-4 w-4 ${isLiked ? 'fill-red-500 text-red-500' : ''}`} />
+            <Heart className={`h-4 w-4 transition-colors ${isLiked ? 'fill-red-500 text-red-500' : ''}`} />
             <span data-testid={`text-likes-${prompt.id}`}>{prompt.likesCount || 0}</span>
           </div>
           <p className="text-muted-foreground text-sm flex-1 line-clamp-1 min-w-0">
@@ -148,11 +191,11 @@ export function PromptCard({
           variant="ghost"
           size="icon"
           onClick={handleCopy}
-          className="shrink-0"
+          className="shrink-0 transition-smooth"
           data-testid={`button-copy-${prompt.id}`}
         >
           {copied ? (
-            <Check className="h-4 w-4 text-green-500" />
+            <Check className="h-4 w-4 text-green-500 animate-fade-in-scale" />
           ) : (
             <Copy className="h-4 w-4" />
           )}
@@ -160,4 +203,4 @@ export function PromptCard({
       </div>
     </Card>
   );
-}
+});

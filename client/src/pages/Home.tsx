@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useMemo, useCallback } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { ArrowUpDown, TrendingUp, Clock, Heart } from "lucide-react";
 import { Header } from "@/components/Header";
@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useToast } from "@/hooks/use-toast";
 import { useSessionId } from "@/hooks/use-session-id";
+import { useDebounce } from "@/hooks/use-debounce";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { type Prompt, type InsertPrompt, type CategoryId, type SearchFilters } from "@shared/schema";
 
@@ -41,13 +42,16 @@ export default function Home() {
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [generatedImage, setGeneratedImage] = useState<string | null>(null);
 
-  const buildQueryParams = () => {
+  // Debounce البحث لتحسين الأداء
+  const debouncedSearchQuery = useDebounce(searchQuery, 300);
+
+  const buildQueryParams = useCallback(() => {
     const params = new URLSearchParams();
-    if (searchQuery) params.set("q", searchQuery);
+    if (debouncedSearchQuery) params.set("q", debouncedSearchQuery);
     if (selectedCategory) params.set("category", selectedCategory);
     if (sortBy) params.set("sortBy", sortBy);
     return params.toString();
-  };
+  }, [debouncedSearchQuery, selectedCategory, sortBy]);
 
   // Response type للـ API الجديد مع Pagination
   interface PromptsResponse {
@@ -61,14 +65,15 @@ export default function Home() {
     };
   }
 
-  const { data: promptsData, isLoading } = useQuery<PromptsResponse>({
-    queryKey: ["/api/prompts", { q: searchQuery, category: selectedCategory, sortBy }],
+  const { data: promptsData, isLoading, isFetching } = useQuery<PromptsResponse>({
+    queryKey: ["/api/prompts", { q: debouncedSearchQuery, category: selectedCategory, sortBy }],
     queryFn: async () => {
       const queryStr = buildQueryParams();
       const response = await fetch(`/api/prompts${queryStr ? `?${queryStr}` : ""}`);
       if (!response.ok) throw new Error("Failed to fetch prompts");
       return response.json();
     },
+    placeholderData: (previousData) => previousData, // الحفاظ على البيانات السابقة أثناء التحميل
   });
 
   const prompts = promptsData?.prompts || [];
@@ -137,16 +142,52 @@ export default function Home() {
       const response = await apiRequest("POST", `/api/prompts/${promptId}/like`, { sessionId });
       return response.json();
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/prompts"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/prompts/liked"] });
+    // Optimistic update للإعجاب الفوري
+    onMutate: async (promptId: string) => {
+      // إلغاء أي طلبات جارية
+      await queryClient.cancelQueries({ queryKey: ["/api/prompts/liked"] });
+      await queryClient.cancelQueries({ queryKey: ["/api/prompts"] });
+      
+      // حفظ البيانات السابقة
+      const previousLiked = queryClient.getQueryData<{ likedPromptIds: string[] }>(["/api/prompts/liked", sessionId]);
+      const previousPrompts = queryClient.getQueryData<PromptsResponse>(["/api/prompts", { q: debouncedSearchQuery, category: selectedCategory, sortBy }]);
+      
+      // تحديث متفائل للإعجابات
+      queryClient.setQueryData<{ likedPromptIds: string[] }>(["/api/prompts/liked", sessionId], (old) => ({
+        likedPromptIds: [...(old?.likedPromptIds || []), promptId]
+      }));
+      
+      // تحديث متفائل لعدد الإعجابات
+      queryClient.setQueryData<PromptsResponse>(["/api/prompts", { q: debouncedSearchQuery, category: selectedCategory, sortBy }], (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          prompts: old.prompts.map(p => 
+            p.id === promptId ? { ...p, likesCount: (p.likesCount || 0) + 1 } : p
+          )
+        };
+      });
+      
+      return { previousLiked, previousPrompts };
     },
-    onError: () => {
+    onError: (_err, _promptId, context) => {
+      // التراجع عند الخطأ
+      if (context?.previousLiked) {
+        queryClient.setQueryData(["/api/prompts/liked", sessionId], context.previousLiked);
+      }
+      if (context?.previousPrompts) {
+        queryClient.setQueryData(["/api/prompts", { q: debouncedSearchQuery, category: selectedCategory, sortBy }], context.previousPrompts);
+      }
       toast({
         title: "خطأ",
         description: "حدث خطأ أثناء الإعجاب",
         variant: "destructive",
       });
+    },
+    onSettled: () => {
+      // تحديث البيانات من الخادم
+      queryClient.invalidateQueries({ queryKey: ["/api/prompts"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/prompts/liked"] });
     },
   });
 
@@ -160,16 +201,46 @@ export default function Home() {
       if (!response.ok) throw new Error("Failed to unlike");
       return response.json();
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/prompts"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/prompts/liked"] });
+    // Optimistic update لإلغاء الإعجاب الفوري
+    onMutate: async (promptId: string) => {
+      await queryClient.cancelQueries({ queryKey: ["/api/prompts/liked"] });
+      await queryClient.cancelQueries({ queryKey: ["/api/prompts"] });
+      
+      const previousLiked = queryClient.getQueryData<{ likedPromptIds: string[] }>(["/api/prompts/liked", sessionId]);
+      const previousPrompts = queryClient.getQueryData<PromptsResponse>(["/api/prompts", { q: debouncedSearchQuery, category: selectedCategory, sortBy }]);
+      
+      queryClient.setQueryData<{ likedPromptIds: string[] }>(["/api/prompts/liked", sessionId], (old) => ({
+        likedPromptIds: (old?.likedPromptIds || []).filter(id => id !== promptId)
+      }));
+      
+      queryClient.setQueryData<PromptsResponse>(["/api/prompts", { q: debouncedSearchQuery, category: selectedCategory, sortBy }], (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          prompts: old.prompts.map(p => 
+            p.id === promptId ? { ...p, likesCount: Math.max(0, (p.likesCount || 0) - 1) } : p
+          )
+        };
+      });
+      
+      return { previousLiked, previousPrompts };
     },
-    onError: () => {
+    onError: (_err, _promptId, context) => {
+      if (context?.previousLiked) {
+        queryClient.setQueryData(["/api/prompts/liked", sessionId], context.previousLiked);
+      }
+      if (context?.previousPrompts) {
+        queryClient.setQueryData(["/api/prompts", { q: debouncedSearchQuery, category: selectedCategory, sortBy }], context.previousPrompts);
+      }
       toast({
         title: "خطأ",
         description: "حدث خطأ أثناء إلغاء الإعجاب",
         variant: "destructive",
       });
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/prompts"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/prompts/liked"] });
     },
   });
 
@@ -274,6 +345,7 @@ export default function Home() {
               <PromptGrid
                 prompts={prompts}
                 isLoading={isLoading}
+                isFetching={isFetching}
                 onGenerate={handleGenerateImage}
                 onView={handleViewPrompt}
                 likedPromptIds={likedPromptIds}
