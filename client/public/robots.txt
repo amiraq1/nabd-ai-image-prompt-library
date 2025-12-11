@@ -1,0 +1,9 @@
+# robots.txt for نبض - إبداع الصور بالذكاء الاصطناعي
+User-agent: *
+Allow: /
+
+# Sitemap location
+Sitemap: /sitemap.xml
+
+# Block API endpoints from crawling
+Disallow: /api/
