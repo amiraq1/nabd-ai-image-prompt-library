@@ -1,41 +1,82 @@
-import type { Express, Request, Response } from "express";
+import type { Express, Request, Response, NextFunction } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { generateImage } from "./gemini";
 import { insertPromptSchema, type SearchFilters, type CategoryId } from "@shared/schema";
 import { randomUUID } from "crypto";
 
-// Rate limiting بسيط في الذاكرة
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT_WINDOW = 60000; // دقيقة واحدة
-const RATE_LIMIT_MAX_REQUESTS = 10; // 10 طلبات توليد صور في الدقيقة
+// Rate limiting محسن في الذاكرة
+interface RateLimitRecord {
+  count: number;
+  resetTime: number;
+}
 
-function checkRateLimit(sessionId: string): boolean {
+const rateLimitMaps = {
+  generate: new Map<string, RateLimitRecord>(),
+  api: new Map<string, RateLimitRecord>(),
+  write: new Map<string, RateLimitRecord>(),
+};
+
+// إعدادات Rate Limiting لكل نوع
+const rateLimitConfigs = {
+  generate: { window: 60000, max: 10 },  // 10 طلبات توليد صور في الدقيقة
+  api: { window: 60000, max: 100 },      // 100 طلب API عام في الدقيقة
+  write: { window: 60000, max: 20 },     // 20 عملية كتابة في الدقيقة
+};
+
+function checkRateLimit(identifier: string, type: keyof typeof rateLimitMaps): { allowed: boolean; remaining: number; resetIn: number } {
   const now = Date.now();
-  const record = rateLimitMap.get(sessionId);
+  const map = rateLimitMaps[type];
+  const config = rateLimitConfigs[type];
+  const record = map.get(identifier);
   
   if (!record || now > record.resetTime) {
-    rateLimitMap.set(sessionId, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
-    return true;
+    map.set(identifier, { count: 1, resetTime: now + config.window });
+    return { allowed: true, remaining: config.max - 1, resetIn: config.window };
   }
   
-  if (record.count >= RATE_LIMIT_MAX_REQUESTS) {
-    return false;
+  if (record.count >= config.max) {
+    return { allowed: false, remaining: 0, resetIn: record.resetTime - now };
   }
   
   record.count++;
-  return true;
+  return { allowed: true, remaining: config.max - record.count, resetIn: record.resetTime - now };
 }
 
 // تنظيف سجلات rate limit القديمة كل 5 دقائق
 setInterval(() => {
   const now = Date.now();
-  for (const [key, value] of rateLimitMap.entries()) {
-    if (now > value.resetTime) {
-      rateLimitMap.delete(key);
+  for (const map of Object.values(rateLimitMaps)) {
+    for (const [key, value] of map.entries()) {
+      if (now > value.resetTime) {
+        map.delete(key);
+      }
     }
   }
 }, 5 * 60 * 1000);
+
+// Middleware للتحقق من Rate Limit
+function rateLimitMiddleware(type: keyof typeof rateLimitMaps) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const identifier = req.ip || req.headers['x-forwarded-for'] as string || 'unknown';
+    const result = checkRateLimit(identifier, type);
+    
+    // إضافة headers للـ Rate Limit
+    res.setHeader('X-RateLimit-Limit', rateLimitConfigs[type].max.toString());
+    res.setHeader('X-RateLimit-Remaining', result.remaining.toString());
+    res.setHeader('X-RateLimit-Reset', Math.ceil(result.resetIn / 1000).toString());
+    
+    if (!result.allowed) {
+      return res.status(429).json({
+        error: 'Too Many Requests',
+        message: 'لقد تجاوزت الحد المسموح من الطلبات. حاول مرة أخرى لاحقاً.',
+        retryAfter: Math.ceil(result.resetIn / 1000)
+      });
+    }
+    
+    next();
+  };
+}
 
 export async function registerRoutes(
   httpServer: Server,
@@ -53,12 +94,15 @@ export async function registerRoutes(
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
         maxAge: 365 * 24 * 60 * 60 * 1000, // سنة واحدة
-        sameSite: 'lax'
+        sameSite: 'strict' // تحسين الأمان
       });
     }
     
     return sessionId;
   }
+
+  // تطبيق Rate Limiting على جميع الـ API endpoints
+  app.use('/api', rateLimitMiddleware('api'));
 
   // Get all prompts with optional filters and pagination
   app.get("/api/prompts", async (req, res) => {
@@ -66,16 +110,21 @@ export async function registerRoutes(
       const filters: SearchFilters = {};
       
       if (req.query.q) {
-        filters.query = req.query.q as string;
+        // تنظيف البحث من الأحرف الخاصة
+        filters.query = String(req.query.q).slice(0, 100).replace(/[<>]/g, '');
       }
       if (req.query.category) {
         filters.category = req.query.category as CategoryId;
       }
       if (req.query.sortBy) {
-        filters.sortBy = req.query.sortBy as "recent" | "popular" | "mostLiked";
+        const validSortOptions = ["recent", "popular", "mostLiked"];
+        const sortBy = req.query.sortBy as string;
+        if (validSortOptions.includes(sortBy)) {
+          filters.sortBy = sortBy as "recent" | "popular" | "mostLiked";
+        }
       }
       if (req.query.minLikes) {
-        filters.minLikes = parseInt(req.query.minLikes as string, 10);
+        filters.minLikes = Math.max(0, parseInt(req.query.minLikes as string, 10) || 0);
       }
       
       // Pagination
@@ -126,8 +175,8 @@ export async function registerRoutes(
     }
   });
 
-  // Create new prompt
-  app.post("/api/prompts", async (req, res) => {
+  // Create new prompt (with write rate limiting)
+  app.post("/api/prompts", rateLimitMiddleware('write'), async (req, res) => {
     try {
       const validatedData = insertPromptSchema.parse(req.body);
       const prompt = await storage.createPrompt(validatedData);
@@ -141,20 +190,16 @@ export async function registerRoutes(
     }
   });
 
-  // Generate image for a prompt (with rate limiting)
-  app.post("/api/prompts/:id/generate", async (req, res) => {
+  // Generate image for a prompt (with strict rate limiting)
+  app.post("/api/prompts/:id/generate", rateLimitMiddleware('generate'), async (req, res) => {
     try {
-      const sessionId = getSessionId(req, res);
-      
-      // التحقق من Rate Limit
-      if (!checkRateLimit(sessionId)) {
-        return res.status(429).json({ 
-          error: "Too many requests", 
-          message: "لقد تجاوزت الحد المسموح من الطلبات. حاول مرة أخرى بعد دقيقة."
-        });
+      // التحقق من صحة ID
+      const promptId = req.params.id;
+      if (!promptId || typeof promptId !== 'string' || promptId.length > 100) {
+        return res.status(400).json({ error: "Invalid prompt ID" });
       }
       
-      const prompt = await storage.getPromptById(req.params.id);
+      const prompt = await storage.getPromptById(promptId);
       if (!prompt) {
         return res.status(404).json({ error: "Prompt not found" });
       }

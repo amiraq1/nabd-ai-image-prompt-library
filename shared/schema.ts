@@ -50,9 +50,20 @@ export const insertPromptSchema = createInsertSchema(prompts).pick({
   description: true,
   category: true,
 }).extend({
-  title: z.string().min(3, "العنوان يجب أن يكون 3 أحرف على الأقل"),
-  promptText: z.string().min(10, "الأمر يجب أن يكون 10 أحرف على الأقل"),
-  description: z.string().min(5, "الوصف يجب أن يكون 5 أحرف على الأقل"),
+  title: z.string()
+    .min(3, "العنوان يجب أن يكون 3 أحرف على الأقل")
+    .max(100, "العنوان يجب أن يكون أقل من 100 حرف")
+    .transform(val => val.trim())
+    .refine(val => !/<[^>]*>/g.test(val), "العنوان يحتوي على محتوى غير مسموح"),
+  promptText: z.string()
+    .min(10, "الأمر يجب أن يكون 10 أحرف على الأقل")
+    .max(2000, "الأمر يجب أن يكون أقل من 2000 حرف")
+    .transform(val => val.trim()),
+  description: z.string()
+    .min(5, "الوصف يجب أن يكون 5 أحرف على الأقل")
+    .max(500, "الوصف يجب أن يكون أقل من 500 حرف")
+    .transform(val => val.trim())
+    .refine(val => !/<[^>]*>/g.test(val), "الوصف يحتوي على محتوى غير مسموح"),
   category: z.enum(["nature", "art", "design", "characters", "fantasy", "architecture", "abstract", "portrait"]),
 });
 
