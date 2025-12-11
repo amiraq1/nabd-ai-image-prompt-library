@@ -1,4 +1,5 @@
 import express, { type Request, Response, NextFunction } from "express";
+import cookieParser from "cookie-parser";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
@@ -9,6 +10,9 @@ const httpServer = createServer(app);
 
 // إخفاء معلومات الخادم لتحسين الأمان
 app.disable('x-powered-by');
+
+// Cookie parser
+app.use(cookieParser());
 
 declare module "http" {
   interface IncomingMessage {

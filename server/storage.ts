@@ -19,7 +19,7 @@ export interface IStorage {
   getUserByUsername(username: string): Promise<User | undefined>;
   createUser(user: InsertUser): Promise<User>;
   
-  getAllPrompts(filters?: SearchFilters): Promise<Prompt[]>;
+  getAllPrompts(filters?: SearchFilters, limit?: number, offset?: number): Promise<{ prompts: Prompt[]; total: number }>;
   getPromptById(id: string): Promise<Prompt | undefined>;
   createPrompt(prompt: InsertPrompt): Promise<Prompt>;
   updatePrompt(id: string, updates: Partial<Prompt>): Promise<Prompt | undefined>;
@@ -51,7 +51,7 @@ export class DatabaseStorage implements IStorage {
     return result[0];
   }
 
-  async getAllPrompts(filters?: SearchFilters): Promise<Prompt[]> {
+  async getAllPrompts(filters?: SearchFilters, limit: number = 20, offset: number = 0): Promise<{ prompts: Prompt[]; total: number }> {
     let conditions: any[] = [];
     
     if (filters?.query) {
@@ -87,11 +87,21 @@ export class DatabaseStorage implements IStorage {
         break;
     }
 
-    const query = conditions.length > 0
-      ? db.select().from(prompts).where(and(...conditions)).orderBy(orderBy)
-      : db.select().from(prompts).orderBy(orderBy);
+    // حساب العدد الإجمالي
+    const countQuery = conditions.length > 0
+      ? db.select({ count: sql<number>`count(*)::int` }).from(prompts).where(and(...conditions))
+      : db.select({ count: sql<number>`count(*)::int` }).from(prompts);
     
-    return await query;
+    const countResult = await countQuery;
+    const total = countResult[0]?.count || 0;
+
+    // جلب البيانات مع pagination
+    const query = conditions.length > 0
+      ? db.select().from(prompts).where(and(...conditions)).orderBy(orderBy).limit(limit).offset(offset)
+      : db.select().from(prompts).orderBy(orderBy).limit(limit).offset(offset);
+    
+    const promptsResult = await query;
+    return { prompts: promptsResult, total };
   }
 
   async getPromptById(id: string): Promise<Prompt | undefined> {

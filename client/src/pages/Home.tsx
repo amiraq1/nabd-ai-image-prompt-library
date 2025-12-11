@@ -49,7 +49,19 @@ export default function Home() {
     return params.toString();
   };
 
-  const { data: prompts = [], isLoading } = useQuery<Prompt[]>({
+  // Response type للـ API الجديد مع Pagination
+  interface PromptsResponse {
+    prompts: Prompt[];
+    pagination: {
+      page: number;
+      limit: number;
+      total: number;
+      totalPages: number;
+      hasMore: boolean;
+    };
+  }
+
+  const { data: promptsData, isLoading } = useQuery<PromptsResponse>({
     queryKey: ["/api/prompts", { q: searchQuery, category: selectedCategory, sortBy }],
     queryFn: async () => {
       const queryStr = buildQueryParams();
@@ -58,6 +70,8 @@ export default function Home() {
       return response.json();
     },
   });
+
+  const prompts = promptsData?.prompts || [];
 
   const { data: likedData } = useQuery<{ likedPromptIds: string[] }>({
     queryKey: ["/api/prompts/liked", sessionId],

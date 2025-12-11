@@ -1,9 +1,41 @@
-import type { Express } from "express";
+import type { Express, Request, Response } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { generateImage } from "./gemini";
 import { insertPromptSchema, type SearchFilters, type CategoryId } from "@shared/schema";
 import { randomUUID } from "crypto";
+
+// Rate limiting بسيط في الذاكرة
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+const RATE_LIMIT_WINDOW = 60000; // دقيقة واحدة
+const RATE_LIMIT_MAX_REQUESTS = 10; // 10 طلبات توليد صور في الدقيقة
+
+function checkRateLimit(sessionId: string): boolean {
+  const now = Date.now();
+  const record = rateLimitMap.get(sessionId);
+  
+  if (!record || now > record.resetTime) {
+    rateLimitMap.set(sessionId, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    return true;
+  }
+  
+  if (record.count >= RATE_LIMIT_MAX_REQUESTS) {
+    return false;
+  }
+  
+  record.count++;
+  return true;
+}
+
+// تنظيف سجلات rate limit القديمة كل 5 دقائق
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of rateLimitMap.entries()) {
+    if (now > value.resetTime) {
+      rateLimitMap.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
 
 export async function registerRoutes(
   httpServer: Server,
@@ -11,14 +43,24 @@ export async function registerRoutes(
 ): Promise<Server> {
   
   // Helper to get or create session ID for anonymous likes
-  function getSessionId(req: any): string {
-    if (!req.cookies?.sessionId) {
-      return req.headers['x-session-id'] as string || randomUUID();
+  function getSessionId(req: Request, res: Response): string {
+    let sessionId = req.cookies?.sessionId || req.headers['x-session-id'] as string;
+    
+    if (!sessionId) {
+      sessionId = randomUUID();
+      // حفظ الـ sessionId كـ cookie
+      res.cookie('sessionId', sessionId, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 365 * 24 * 60 * 60 * 1000, // سنة واحدة
+        sameSite: 'lax'
+      });
     }
-    return req.cookies.sessionId;
+    
+    return sessionId;
   }
 
-  // Get all prompts with optional filters
+  // Get all prompts with optional filters and pagination
   app.get("/api/prompts", async (req, res) => {
     try {
       const filters: SearchFilters = {};
@@ -36,8 +78,22 @@ export async function registerRoutes(
         filters.minLikes = parseInt(req.query.minLikes as string, 10);
       }
       
-      const prompts = await storage.getAllPrompts(filters);
-      res.json(prompts);
+      // Pagination
+      const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+      const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string, 10) || 20));
+      const offset = (page - 1) * limit;
+      
+      const result = await storage.getAllPrompts(filters, limit, offset);
+      res.json({
+        prompts: result.prompts,
+        pagination: {
+          page,
+          limit,
+          total: result.total,
+          totalPages: Math.ceil(result.total / limit),
+          hasMore: page < Math.ceil(result.total / limit)
+        }
+      });
     } catch (error) {
       console.error("Error fetching prompts:", error);
       res.status(500).json({ error: "Failed to fetch prompts" });
@@ -47,7 +103,7 @@ export async function registerRoutes(
   // Get user's liked prompts
   app.get("/api/prompts/liked", async (req, res) => {
     try {
-      const sessionId = req.query.sessionId as string || getSessionId(req);
+      const sessionId = req.query.sessionId as string || getSessionId(req, res);
       const likedPromptIds = await storage.getUserLikedPrompts(sessionId);
       res.json({ likedPromptIds, sessionId });
     } catch (error) {
@@ -85,9 +141,19 @@ export async function registerRoutes(
     }
   });
 
-  // Generate image for a prompt
+  // Generate image for a prompt (with rate limiting)
   app.post("/api/prompts/:id/generate", async (req, res) => {
     try {
+      const sessionId = getSessionId(req, res);
+      
+      // التحقق من Rate Limit
+      if (!checkRateLimit(sessionId)) {
+        return res.status(429).json({ 
+          error: "Too many requests", 
+          message: "لقد تجاوزت الحد المسموح من الطلبات. حاول مرة أخرى بعد دقيقة."
+        });
+      }
+      
       const prompt = await storage.getPromptById(req.params.id);
       if (!prompt) {
         return res.status(404).json({ error: "Prompt not found" });
